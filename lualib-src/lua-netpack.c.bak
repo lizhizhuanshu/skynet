@@ -24,9 +24,6 @@
 #define TYPE_WARNING 6
 #define TYPE_INIT 7
 
-#define HEADER_SIZE 4
-#define MAX_MESSAGE_SIZE 1024*1000*5
-//需要注意虽然头部是4字节的但因为一些函数的限制，只能保存int的长度
 /*
 	Each package is uint16 + data , uint16 (serialized in big-endian) is the number of bytes comprising the data .
  */
@@ -40,8 +37,8 @@ struct netpack {
 struct uncomplete {
 	struct netpack pack;
 	struct uncomplete * next;
-	int read;				//接受到的字节不满头部时<0,并且是已经接收到字节的复数
-	uint32_t header;//接收到的字节不满4个时保存在这里
+	int read;
+	int header;
 };
 
 struct queue {
@@ -185,29 +182,21 @@ save_uncomplete(lua_State *L, int fd) {
 
 static inline int
 read_size(uint8_t * buffer) {
-	int r = *((uint32_t*)buffer);
-	return be32toh(r);
+	int r = (int)buffer[0] << 8 | (int)buffer[1];
+	return r;
 }
 
-static inline int isBadPackSize(int packSize){
-	return packSize > MAX_MESSAGE_SIZE
-		|| packSize<=0;
-}
-
-static int
+static void
 push_more(lua_State *L, int fd, uint8_t *buffer, int size) {
-	if (size < HEADER_SIZE) {
+	if (size == 1) {
 		struct uncomplete * uc = save_uncomplete(L, fd);
-		uc->read = -size;
-		memcpy(&(uc->header),buffer,size);
-		return 0;
+		uc->read = -1;
+		uc->header = *buffer;
+		return;
 	}
 	int pack_size = read_size(buffer);
-	if(isBadPackSize(pack_size)){
-		return -1;
-	}
-	buffer += HEADER_SIZE;
-	size -= HEADER_SIZE;
+	buffer += 2;
+	size -= 2;
 
 	if (size < pack_size) {
 		struct uncomplete * uc = save_uncomplete(L, fd);
@@ -215,16 +204,15 @@ push_more(lua_State *L, int fd, uint8_t *buffer, int size) {
 		uc->pack.size = pack_size;
 		uc->pack.buffer = skynet_malloc(pack_size);
 		memcpy(uc->pack.buffer, buffer, size);
-		return 0;
+		return;
 	}
 	push_data(L, fd, buffer, pack_size, 1);
 
 	buffer += pack_size;
 	size -= pack_size;
 	if (size > 0) {
-		return push_more(L, fd, buffer, size);
+		push_more(L, fd, buffer, size);
 	}
-	return 0;
 }
 
 static void
@@ -244,28 +232,15 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size) {
 	if (uc) {
 		// fill uncomplete
 		if (uc->read < 0) {
-			int completeSize = -(uc->read);
-			if(completeSize+size < HEADER_SIZE)
-			{
-				unsigned char* ptr = &(uc->header);
-				memcpy(ptr+completeSize,buffer,size);
-				uc->read -=size;
-				return 1;
-			}
-			int headerNeedSize = HEADER_SIZE-completeSize;
-			unsigned char* ptr = &(uc->header);
-			memcpy(ptr+completeSize,buffer,headerNeedSize);
-			int pack_size = be32toh(uc->header);
-			if(isBadPackSize(pack_size)){
-				return -1;
-			}
-			buffer += headerNeedSize;
-			size -= headerNeedSize;
+			// read size
+			assert(uc->read == -1);
+			int pack_size = *buffer;
+			pack_size |= uc->header << 8 ;
+			++buffer;
+			--size;
 			uc->pack.size = pack_size;
 			uc->pack.buffer = skynet_malloc(pack_size);
 			uc->read = 0;
-			if(size == 0)
-				return 1;
 		}
 		int need = uc->pack.size - uc->read;
 		if (size < need) {
@@ -290,25 +265,19 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size) {
 		// more data
 		push_data(L, fd, uc->pack.buffer, uc->pack.size, 0);
 		skynet_free(uc);
-		int err = push_more(L, fd, buffer, size);
-		if (err)
-			return -1;
-		
+		push_more(L, fd, buffer, size);
 		lua_pushvalue(L, lua_upvalueindex(TYPE_MORE));
 		return 2;
 	} else {
-		if (size < HEADER_SIZE) {
+		if (size == 1) {
 			struct uncomplete * uc = save_uncomplete(L, fd);
-			uc->read = -size;
-			memcpy(&(uc->header),buffer,size);
+			uc->read = -1;
+			uc->header = *buffer;
 			return 1;
 		}
 		int pack_size = read_size(buffer);
-		if(isBadPackSize(pack_size)){
-			return -1;
-		}
-		buffer+=HEADER_SIZE;
-		size-=HEADER_SIZE;
+		buffer+=2;
+		size-=2;
 
 		if (size < pack_size) {
 			struct uncomplete * uc = save_uncomplete(L, fd);
@@ -332,9 +301,7 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size) {
 		push_data(L, fd, buffer, pack_size, 1);
 		buffer += pack_size;
 		size -= pack_size;
-		int err = push_more(L, fd, buffer, size);
-		if (err)
-			return -1;
+		push_more(L, fd, buffer, size);
 		lua_pushvalue(L, lua_upvalueindex(TYPE_MORE));
 		return 2;
 	}
@@ -383,20 +350,10 @@ lfilter(lua_State *L) {
 	lua_settop(L, 1);
 
 	switch(message->type) {
-	case SKYNET_SOCKET_TYPE_DATA:{
+	case SKYNET_SOCKET_TYPE_DATA:
 		// ignore listen id (message->id)
 		assert(size == -1);	// never padding string
-		int r= filter_data(L, message->id, (uint8_t *)buffer, message->ud);
-		if(r == -1){
-			close_uncomplete(L, message->id);
-			lua_pushvalue(L, lua_upvalueindex(TYPE_ERROR));
-			lua_pushinteger(L, message->id);
-			lua_pushstring(L,"message size too big");
-			r = 4;
-		}
-		return r;
-	}
-
+		return filter_data(L, message->id, (uint8_t *)buffer, message->ud);
 	case SKYNET_SOCKET_TYPE_CONNECT:
 		lua_pushvalue(L, lua_upvalueindex(TYPE_INIT));
 		lua_pushinteger(L, message->id);
@@ -476,7 +433,8 @@ tolstring(lua_State *L, size_t *sz, int index) {
 
 static inline void
 write_size(uint8_t * buffer, int len) {
-	*((uint32_t*)buffer)=htobe32(len);
+	buffer[0] = (len >> 8) & 0xff;
+	buffer[1] = len & 0xff;
 }
 
 static int
@@ -487,12 +445,12 @@ lpack(lua_State *L) {
 		return luaL_error(L, "Invalid size (too long) of data : %d", (int)len);
 	}
 
-	uint8_t * buffer = skynet_malloc(len + HEADER_SIZE);
+	uint8_t * buffer = skynet_malloc(len + 2);
 	write_size(buffer, len);
-	memcpy(buffer+HEADER_SIZE, ptr, len);
+	memcpy(buffer+2, ptr, len);
 
 	lua_pushlightuserdata(L, buffer);
-	lua_pushinteger(L, len + HEADER_SIZE);
+	lua_pushinteger(L, len + 2);
 
 	return 2;
 }
